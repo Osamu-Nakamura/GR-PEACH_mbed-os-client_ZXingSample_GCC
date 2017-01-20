@@ -26,57 +26,19 @@
 #include "rtos.h"
 
 #if MBED_CONF_APP_NETWORK_INTERFACE == WIFI
-    #if TARGET_UBLOX_EVK_ODIN_W2
-        #include "OdinWiFiInterface.h"
-        OdinWiFiInterface wifi;
-	#else
-		#include "ESP8266Interface.h"
-		ESP8266Interface wifi(MBED_CONF_APP_WIFI_TX, MBED_CONF_APP_WIFI_RX);
+    #if(1) //bp3595
+        #include "LWIPBP3595Interface.h"
+        LWIPBP3595Interface wifi;
+        DigitalOut usb1en(P3_8);
     #endif
 #elif MBED_CONF_APP_NETWORK_INTERFACE == ETHERNET
     #include "EthernetInterface.h"
     EthernetInterface eth;
-#elif MBED_CONF_APP_NETWORK_INTERFACE == MESH_LOWPAN_ND
-    #define MESH
-    #include "NanostackInterface.h"
-    LoWPANNDInterface mesh;
-#elif MBED_CONF_APP_NETWORK_INTERFACE == MESH_THREAD
-    #define MESH
-    #include "NanostackInterface.h"
-    ThreadInterface mesh;
 #endif
 
-#if defined(MESH)
-#if MBED_CONF_APP_MESH_RADIO_TYPE == ATMEL
-#include "NanostackRfPhyAtmel.h"
-NanostackRfPhyAtmel rf_phy(ATMEL_SPI_MOSI, ATMEL_SPI_MISO, ATMEL_SPI_SCLK, ATMEL_SPI_CS,
-                           ATMEL_SPI_RST, ATMEL_SPI_SLP, ATMEL_SPI_IRQ, ATMEL_I2C_SDA, ATMEL_I2C_SCL);
-#elif MBED_CONF_APP_MESH_RADIO_TYPE == MCR20
-#include "NanostackRfPhyMcr20a.h"
-NanostackRfPhyMcr20a rf_phy(MCR20A_SPI_MOSI, MCR20A_SPI_MISO, MCR20A_SPI_SCLK, MCR20A_SPI_CS, MCR20A_SPI_RST, MCR20A_SPI_IRQ);
-#endif //MBED_CONF_APP_RADIO_TYPE
-#endif //MESH
-
-#ifdef MESH
-    // Mesh does not have DNS, so must use direct IPV6 address
-    #define MBED_SERVER_ADDRESS "coaps://[2607:f0d0:2601:52::20]:5684"
-#else
-    // This is address to mbed Device Connector, name based
-    // assume all other stacks support DNS properly
-    #define MBED_SERVER_ADDRESS "coap://api.connector.mbed.com:5684"
-#endif
+#define MBED_SERVER_ADDRESS "coap://api.connector.mbed.com:5684"
 
 RawSerial output(USBTX, USBRX);
-
-// Status indication
-DigitalOut red_led(LED1);
-DigitalOut green_led(LED2);
-DigitalOut blue_led(LED3);
-Ticker status_ticker;
-void blinky() {
-    green_led = !green_led;
-
-}
 
 // These are example resource values for the Device Object
 struct MbedClientDevice device = {
@@ -89,7 +51,9 @@ struct MbedClientDevice device = {
 // Instantiate the class which implements LWM2M Client API (from simpleclient.h)
 MbedClient mbed_client(device);
 
-
+#if(1)  //for zxing with camera
+InterruptIn unreg_button(USER_BUTTON0);
+#else
 // In case of K64F board , there is button resource available
 // to change resource value and unregister
 #ifdef TARGET_K64F
@@ -101,6 +65,12 @@ InterruptIn unreg_button(SW3);
 // there is no functionality to unregister.
 Ticker timer;
 #endif
+#endif
+
+// LED Output
+DigitalOut led1(LED1);
+DigitalOut led2(LED2);
+DigitalOut led3(LED3);
 
 /*
  * Arguments for running "blink" in it's own thread.
@@ -123,6 +93,7 @@ public:
  * When the function blink is executed, the pattern is read, and the LED
  * will blink based on the pattern.
  */
+
 class LedResource {
 public:
     LedResource() {
@@ -130,6 +101,14 @@ public:
         led_object = M2MInterfaceFactory::create_object("3201");
         M2MObjectInstance* led_inst = led_object->create_object_instance();
 
+        // 5855 = Multi-state output
+        M2MResource* color_res = led_inst->create_dynamic_resource("5855", "Color",
+            M2MResourceInstance::STRING, false);
+        // read and write
+        color_res->set_operation(M2MBase::GET_PUT_ALLOWED);
+        // set red as initial color
+        color_res->set_value((const uint8_t*)"red", 3);
+        
         // 5853 = Multi-state output
         M2MResource* pattern_res = led_inst->create_dynamic_resource("5853", "Pattern",
             M2MResourceInstance::STRING, false);
@@ -145,89 +124,155 @@ public:
         led_res->set_operation(M2MBase::POST_ALLOWED);
         // when a POST comes in, we want to execute the led_execute_callback
         led_res->set_execute_function(execute_callback(this, &LedResource::blink));
-        // Completion of execute function can take a time, that's why delayed response is used
-        led_res->set_delayed_response(true);
-        blink_args = new BlinkArgs();
-    }
-
-    ~LedResource() {
-        delete blink_args;
     }
 
     M2MObject* get_object() {
         return led_object;
     }
 
-    void blink(void *argument) {
+    void blink(void *) {
         // read the value of 'Pattern'
-        status_ticker.detach();
-        green_led = 1;
-
         M2MObjectInstance* inst = led_object->object_instance();
         M2MResource* res = inst->resource("5853");
-        // Clear previous blink data
-        blink_args->clear();
+        // read the value of 'Color'
+        M2MObjectInstance* instC = led_object->object_instance();
+        M2MResource* resC = instC->resource("5855");
 
         // values in mbed Client are all buffers, and we need a vector of int's
         uint8_t* buffIn = NULL;
         uint32_t sizeIn;
         res->get_value(buffIn, sizeIn);
+        
+        uint8_t* cbuffIn = NULL;
+        uint32_t csizeIn;
+        resC->get_value(cbuffIn, csizeIn);
 
         // turn the buffer into a string, and initialize a vector<int> on the heap
         std::string s((char*)buffIn, sizeIn);
-        free(buffIn);
+        std::vector<uint32_t>* v = new std::vector<uint32_t>;
+
         output.printf("led_execute_callback pattern=%s\r\n", s.c_str());
 
         // our pattern is something like 500:200:500, so parse that
         std::size_t found = s.find_first_of(":");
         while (found!=std::string::npos) {
-            blink_args->blink_pattern.push_back(atoi((const char*)s.substr(0,found).c_str()));
+
+            v->push_back(atoi((const char*)s.substr(0,found).c_str()));
             s = s.substr(found+1);
             found=s.find_first_of(":");
             if(found == std::string::npos) {
-                blink_args->blink_pattern.push_back(atoi((const char*)s.c_str()));
+                v->push_back(atoi((const char*)s.c_str()));
             }
         }
-        // check if POST contains payload
-        if (argument) {
-            M2MResource::M2MExecuteParameter* param = (M2MResource::M2MExecuteParameter*)argument;
-            String object_name = param->get_argument_object_name();
-            uint16_t object_instance_id = param->get_argument_object_instance_id();
-            String resource_name = param->get_argument_resource_name();
-            int payload_length = param->get_argument_value_length();
-            uint8_t* payload = param->get_argument_value();
-            output.printf("Resource: %s/%d/%s executed\r\n", object_name.c_str(), object_instance_id, resource_name.c_str());
-            output.printf("Payload: %.*s\r\n", payload_length, payload);
-        }
+
+
         // do_blink is called with the vector, and starting at -1
-        blinky_thread.start(this, &LedResource::do_blink);
+        do_blink(v, cbuffIn, 0);
     }
 
 private:
     M2MObject* led_object;
-    Thread blinky_thread;
-    BlinkArgs *blink_args;
-    void do_blink() {
-        for (;;) {
-            // blink the LED
-            red_led = !red_led;
-            // up the position, if we reached the end of the vector
-            if (blink_args->position >= blink_args->blink_pattern.size()) {
-                // send delayed response after blink is done
-                M2MObjectInstance* inst = led_object->object_instance();
-                M2MResource* led_res = inst->resource("5850");
-                led_res->send_delayed_post_response();
-                red_led = 1;
-                status_ticker.attach_us(blinky, 250000);
-                return;
-            }
-            // Wait requested time, then continue prosessing the blink pattern from next position.
-            Thread::wait(blink_args->blink_pattern.at(blink_args->position));
-            blink_args->position++;
+
+    void do_blink(std::vector<uint32_t>* pattern, uint8_t* color,  uint16_t position) {
+        
+        if (!strcmp((char *)color, "red")) {
+            // blink the LED in red color
+            led1 = !led1;
         }
+        else if (!strcmp((char *)color, "green")) {
+            // blink in green color
+            led2 = !led2;
+        }
+        else if (!strcmp((char *)color, "blue")) {
+            // blink in blue color
+            led3 = !led3;
+        }
+        else if (!strcmp((char *)color, "cyan")) {
+            // blink in cyan color
+            led2 = !led2;
+            led3 = !led3;
+        }
+        else if (!strcmp((char *)color, "yellow")) {
+            // blink in yellow color
+            led1 = !led1;
+            led2 = !led2;
+        }
+        else if (!strcmp((char *)color, "magenta")) {
+            // blink in magenta color
+            led1 = !led1;
+            led3 = !led3;
+        }            
+        else if (!strcmp((char *)color, "white")) {
+            // blink in white color
+            led1 = !led1;
+            led2 = !led2;
+            led3 = !led3;
+        }
+        else {
+            // no operation
+        }
+
+        // up the position, if we reached the end of the vector
+        if (position >= pattern->size()) {
+            // free memory, and exit this function
+            delete pattern;
+            return;
+        }
+
+        // how long do we need to wait before the next blink?
+        uint32_t delay_ms = pattern->at(position);
+
+        // Invoke same function after `delay_ms` (upping position)
+        Thread::wait(delay_ms);
+        do_blink(pattern, color, ++position);
     }
 };
 
+#if(1)  //for zxing with camera
+/*
+ * The Zxing contains a function (send string).
+ * When `handle_string_send` is executed, the string after decoding is sent.
+ */
+class ZxingResource {
+public:
+    ZxingResource() {
+        // create ObjectID with metadata tag of '3202', which is 'send string'
+        zxing_object = M2MInterfaceFactory::create_object("3202");
+        M2MObjectInstance* zxing_inst = zxing_object->create_object_instance();
+        // create resource with ID '5700', which is 'send string'
+        M2MResource* zxing_res = zxing_inst->create_dynamic_resource("5700", "zxing",
+            M2MResourceInstance::STRING, true);
+        // we can read this value
+        zxing_res->set_operation(M2MBase::GET_ALLOWED);
+        // set initial value (all values in mbed Client are buffers)
+        // to be able to read this data easily in the Connector console, we'll use a string
+        zxing_res->set_value((uint8_t*)"0", 1);        
+    }
+
+    ~ZxingResource() {
+    }
+
+    M2MObject* get_object() {
+        return zxing_object;
+    }
+
+    /*
+     * When you success the decode process of barcode, we send the string after decoding to mbed Device Connector.
+     */
+    void handle_string_send(char * addr, int size) {
+        M2MObjectInstance* inst = zxing_object->object_instance();
+        M2MResource* res = inst->resource("5700");
+
+        printf("%s\r\n", addr);
+
+        // tell the string to connector
+        res->set_value((uint8_t *)addr, size);
+    }
+
+private:
+    M2MObject* zxing_object;
+};
+#else
 /*
  * The button contains one property (click count).
  * When `handle_button_click` is executed, the counter updates.
@@ -280,6 +325,7 @@ private:
     M2MObject* btn_object;
     uint16_t counter;
 };
+#endif
 
 class BigPayloadResource {
 public:
@@ -331,25 +377,49 @@ private:
 };
 
 // Network interaction must be performed outside of interrupt context
+#if(1)  //for zxing with camera
+ZxingResource zxing_resource;
+#else
 Semaphore updates(0);
+#endif
 volatile bool registered = false;
 volatile bool clicked = false;
 osThreadId mainThread;
 
 void unregister() {
     registered = false;
+#if(1)  //for zxing with camera
+#else
     updates.release();
+#endif
 }
 
+#if(1)  //for zxing with camera
+#else
 void button_clicked() {
     clicked = true;
     updates.release();
 }
+#endif
 
 // debug printf function
 void trace_printer(const char* str) {
     printf("%s\r\n", str);
 }
+
+// Status indication
+Ticker status_ticker;
+DigitalOut status_led(LED4);
+void blinky() { status_led = !status_led; }
+
+#if(1)  //for zxing with camera
+extern void zxing_init(void (*pfunc)(char * addr, int size));
+extern int zxing_loop();
+
+static void callback_zxing(char * addr, int size) {
+    zxing_resource.handle_string_send(addr, size);
+}
+#endif
 
 // Entry point to the program
 int main() {
@@ -376,8 +446,6 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
 #endif
 
     srand(seed);
-    red_led = 1;
-    blue_led = 1;
     status_ticker.attach_us(blinky, 250000);
     // Keep track of the main thread
     mainThread = osThreadGetId();
@@ -399,18 +467,18 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
     int connect_success = -1;
 #if MBED_CONF_APP_NETWORK_INTERFACE == WIFI
     output.printf("\n\rConnecting to WiFi...\r\n");
-    connect_success = wifi.connect(MBED_CONF_APP_WIFI_SSID, MBED_CONF_APP_WIFI_PASSWORD, NSAPI_SECURITY_WPA_WPA2);
+#if(1) //bp3595
+    usb1en = 1;
+    Thread::wait(5);
+    usb1en = 0;
+    Thread::wait(5);
+    connect_success = wifi.connect(MBED_CONF_APP_WIFI_SSID, MBED_CONF_APP_WIFI_PASSWORD, MBED_CONF_APP_WIFI_SECURITY);
+#endif
     network_interface = &wifi;
 #elif MBED_CONF_APP_NETWORK_INTERFACE == ETHERNET
     output.printf("\n\rConnecting to ethernet...\r\n");
     connect_success = eth.connect();
     network_interface = &eth;
-#endif
-#ifdef MESH
-    output.printf("\n\rConnecting to Mesh...\r\n");
-    mesh.initialize(&rf_phy);
-    connect_success = mesh.connect();
-    network_interface = &mesh;
 #endif
     if(connect_success == 0) {
     output.printf("\n\rConnected to Network successfully\r\n");
@@ -426,6 +494,13 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
     }
 
     // we create our button and LED resources
+#if(1)  //for zxing with camera
+    LedResource led_resource;
+
+    // On press of USER_BUTTON0 button on GR-PEACH board, example application
+    // will call unregister API towards mbed Device Connector
+    unreg_button.fall(&unregister);
+#else
     ButtonResource button_resource;
     LedResource led_resource;
     BigPayloadResource big_payload_resource;
@@ -442,6 +517,7 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
     // Send update of endpoint resource values to connector every 15 seconds periodically
     timer.attach(&button_clicked, 15.0);
 #endif
+#endif
 
     // Create endpoint interface to manage register and unregister
     mbed_client.create_interface(MBED_SERVER_ADDRESS, network_interface);
@@ -455,9 +531,13 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
 
     // Add objects to list
     object_list.push_back(device_object);
+#if(1)  //for zxing with camera
+    object_list.push_back(zxing_resource.get_object());
+#else
     object_list.push_back(button_resource.get_object());
+#endif
     object_list.push_back(led_resource.get_object());
-    object_list.push_back(big_payload_resource.get_object());
+//    object_list.push_back(big_payload_resource.get_object());
 
     // Set endpoint registration object
     mbed_client.set_register_object(register_object);
@@ -466,6 +546,24 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
     mbed_client.test_register(register_object, object_list);
     registered = true;
 
+#if(1)
+    zxing_init(&callback_zxing);
+    Timer update_timer;
+    update_timer.reset();
+    update_timer.start();
+
+    while (registered) {
+        if (zxing_loop() == 0) {
+            update_timer.reset();
+        } else if (update_timer.read() >= 25) {
+            mbed_client.test_update_register();
+            update_timer.reset();
+        } else {
+            // do nothing
+        }
+        Thread::wait(5);
+    }
+#else
     while (true) {
         updates.wait(25000);
         if(registered) {
@@ -480,7 +578,7 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
             button_resource.handle_button_click();
         }
     }
-
+#endif
     mbed_client.test_unregister();
     status_ticker.detach();
 }
